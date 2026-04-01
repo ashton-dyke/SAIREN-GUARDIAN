@@ -1046,6 +1046,621 @@ class MeshConfig:
     cfc_surprise_high_pct: float = 90.0
 
 
+@dataclass
+class PumpHealthConfig:
+    """
+    Configuration for jockey pump health monitoring.
+
+    Typical offshore fire ring main jockey pump: small single-stage
+    centrifugal, close-coupled to a 2-pole induction motor, 50 Hz supply.
+    Maintains static pressure on the ring between fire pump demand events.
+    """
+
+    # --- Pump mechanical parameters ---
+    pump_power_kw: float = 7.5
+    pump_rpm: float = 2950.0       # 2-pole, 50 Hz, ~1.7% slip
+    pump_poles: int = 2
+    supply_freq_hz: float = 50.0
+    n_vanes: int = 6               # impeller vane count
+
+    # --- Bearing geometry (6205 deep groove ball bearing) ---
+    # Typical for motors in the 5-15 kW class
+    n_balls: int = 9
+    ball_diameter_mm: float = 7.938
+    pitch_diameter_mm: float = 38.5
+    contact_angle_deg: float = 0.0  # deep groove
+
+    # --- MCSA parameters ---
+    slip_nominal: float = 0.017     # nominal slip at rated load
+    mcsa_n_fft_bins: int = 2048     # high resolution for sideband detection
+    mcsa_max_freq_hz: float = 200.0 # focus around supply freq + harmonics
+
+    # --- Temperature baselines (degrees C) ---
+    temp_bearing_de_nominal: float = 55.0   # drive-end bearing
+    temp_bearing_nde_nominal: float = 50.0  # non-drive-end (lower load)
+    temp_winding_nominal: float = 75.0      # Class F insulation, normal
+    temp_seal_nominal: float = 45.0         # mechanical seal / gland packing
+    temp_ambient: float = 35.0              # offshore machinery space
+    temp_alarm_delta: float = 15.0          # degrees above nominal -> alarm
+    temp_trip_delta: float = 25.0           # degrees above nominal -> trip
+
+    # --- Vibration analysis ---
+    vib_n_fft_bins: int = 512
+    vib_max_freq_hz: float = 1000.0         # pump vibration mostly < 500 Hz
+    vib_alarm_mm_s: float = 4.5             # ISO 10816-3 Zone B/C boundary
+    vib_trip_mm_s: float = 7.1              # ISO 10816-3 Zone C/D boundary
+
+    # --- Health index fusion weights ---
+    health_weight_vibration: float = 0.40
+    health_weight_temperature: float = 0.30
+    health_weight_mcsa: float = 0.30
+
+    # --- Demo scenario ---
+    pump_demo_length: int = 1200
+    degradation_start: int = 300    # severity ramp begins
+    degradation_end: int = 900      # severity reaches 1.0
+    pump_trip_step: int = 900       # pump trips offline
+    fire_pump_start_step: int = 920 # backup fire pump auto-starts
+
+    # Jockey pump cycling (normal duty cycle)
+    pump_on_duration: int = 30      # steps running
+    pump_off_duration: int = 50     # steps idle (pressure holding)
+
+
+# ============================================================================
+#  PUMP PHYSICS UTILITIES
+# ============================================================================
+
+class PumpPhysics:
+    """
+    Static methods for pump-specific frequency calculations.
+    All from first principles -- bearing geometry, motor slip, vane count.
+    """
+
+    @staticmethod
+    def bearing_defect_freqs(rpm: float, n_balls: int, ball_dia_mm: float,
+                             pitch_dia_mm: float, contact_angle_deg: float) -> dict:
+        """
+        Characteristic bearing defect frequencies from geometry.
+
+        BPFO = Ball Pass Frequency Outer race
+        BPFI = Ball Pass Frequency Inner race
+        BSF  = Ball Spin Frequency
+        FTF  = Fundamental Train (cage) Frequency
+        """
+        shaft_freq = rpm / 60.0
+        bd = ball_dia_mm
+        pd = pitch_dia_mm
+        alpha = math.radians(contact_angle_deg)
+        cos_a = math.cos(alpha)
+
+        bpfo = (n_balls / 2.0) * shaft_freq * (1.0 - (bd / pd) * cos_a)
+        bpfi = (n_balls / 2.0) * shaft_freq * (1.0 + (bd / pd) * cos_a)
+        bsf = (pd / (2.0 * bd)) * shaft_freq * (1.0 - ((bd / pd) * cos_a) ** 2)
+        ftf = (shaft_freq / 2.0) * (1.0 - (bd / pd) * cos_a)
+
+        return {
+            "shaft": shaft_freq,
+            "BPFO": bpfo,
+            "BPFI": bpfi,
+            "BSF": bsf,
+            "FTF": ftf,
+            "vane_pass": shaft_freq * 6,  # default 6 vanes
+        }
+
+    @staticmethod
+    def mcsa_broken_bar_sidebands(line_freq: float, slip: float,
+                                   n_harmonics: int = 3) -> list:
+        """Sideband frequencies for broken rotor bars: f_line +/- 2*k*s*f."""
+        sidebands = []
+        for k in range(1, n_harmonics + 1):
+            offset = 2.0 * k * slip * line_freq
+            sidebands.append(line_freq - offset)
+            sidebands.append(line_freq + offset)
+        return sidebands
+
+    @staticmethod
+    def mcsa_eccentricity_freqs(line_freq: float, slip: float,
+                                 poles: int) -> list:
+        """Eccentricity sideband frequencies."""
+        p = poles / 2.0  # pole pairs
+        f_rot = line_freq * (1.0 - slip) / p
+        return [line_freq - f_rot, line_freq + f_rot]
+
+
+# ============================================================================
+#  PUMP SENSOR SIMULATOR
+# ============================================================================
+
+class PumpSensorSimulator:
+    """
+    Generates realistic time-evolving sensor data for a jockey pump
+    across three modalities: vibration, temperature, and motor current.
+
+    Fault progression is parameterised by severity (0.0 = healthy, 1.0 = failed).
+    The demo ramps severity linearly from degradation_start to degradation_end.
+    """
+
+    def __init__(self, pcfg: PumpHealthConfig, seed: int = 55):
+        self.pcfg = pcfg
+        self.rng = np.random.default_rng(seed)
+
+        # Pre-compute characteristic frequencies
+        self.freqs = PumpPhysics.bearing_defect_freqs(
+            pcfg.pump_rpm, pcfg.n_balls, pcfg.ball_diameter_mm,
+            pcfg.pitch_diameter_mm, pcfg.contact_angle_deg,
+        )
+        self.mcsa_bars = PumpPhysics.mcsa_broken_bar_sidebands(
+            pcfg.supply_freq_hz, pcfg.slip_nominal,
+        )
+        self.mcsa_ecc = PumpPhysics.mcsa_eccentricity_freqs(
+            pcfg.supply_freq_hz, pcfg.slip_nominal, pcfg.pump_poles,
+        )
+
+        # Thermal state (persists across steps for time-constant behaviour)
+        self.temp_state = {
+            "bearing_de": pcfg.temp_bearing_de_nominal,
+            "bearing_nde": pcfg.temp_bearing_nde_nominal,
+            "winding": pcfg.temp_winding_nominal,
+            "seal": pcfg.temp_seal_nominal,
+        }
+
+    def _is_pump_running(self, t: int) -> bool:
+        """Jockey pump duty cycle: on for N steps, off for M steps."""
+        pcfg = self.pcfg
+        # After trip, pump is off permanently
+        if t >= pcfg.pump_trip_step:
+            return False
+        cycle = pcfg.pump_on_duration + pcfg.pump_off_duration
+        phase = t % cycle
+        return phase < pcfg.pump_on_duration
+
+    def get_severity(self, t: int) -> float:
+        """Linear fault severity ramp."""
+        pcfg = self.pcfg
+        if t < pcfg.degradation_start:
+            return 0.0
+        if t >= pcfg.degradation_end:
+            return 1.0
+        return (t - pcfg.degradation_start) / (pcfg.degradation_end - pcfg.degradation_start)
+
+    def get_readings(self, t: int) -> dict:
+        """Full sensor reading at timestep t."""
+        pcfg = self.pcfg
+        severity = self.get_severity(t)
+        running = self._is_pump_running(t)
+
+        # --- Temperature (evolves with thermal time constants) ---
+        temps = self._simulate_temperatures(severity, running)
+
+        # --- Vibration spectrum ---
+        if running:
+            vib_spectrum, vib_rms = self._simulate_vibration(severity)
+        else:
+            vib_spectrum = np.zeros(pcfg.vib_n_fft_bins, dtype=np.float32)
+            vib_rms = 0.0
+
+        # --- Motor current spectrum ---
+        if running:
+            cur_spectrum, cur_rms = self._simulate_current(severity)
+        else:
+            cur_spectrum = np.zeros(pcfg.mcsa_n_fft_bins, dtype=np.float32)
+            cur_rms = 0.0
+
+        return {
+            "temperatures": dict(self.temp_state),
+            "vibration_spectrum": vib_spectrum,
+            "vibration_rms_mm_s": vib_rms,
+            "current_spectrum": cur_spectrum,
+            "current_rms_a": cur_rms,
+            "pump_running": running,
+            "fault_severity": severity,
+        }
+
+    def _simulate_temperatures(self, severity: float, running: bool) -> dict:
+        """Thermal model with time constants. Bearing temp rises with friction."""
+        pcfg = self.pcfg
+        tau = 0.05  # thermal time constant (slow response)
+
+        if running:
+            # Targets shift with severity (more friction = more heat)
+            targets = {
+                "bearing_de": pcfg.temp_bearing_de_nominal + severity * 30.0,
+                "bearing_nde": pcfg.temp_bearing_nde_nominal + severity * 15.0,
+                "winding": pcfg.temp_winding_nominal + severity * 10.0,
+                "seal": pcfg.temp_seal_nominal + severity * 8.0,
+            }
+        else:
+            # Cool toward ambient when off
+            targets = {k: pcfg.temp_ambient for k in self.temp_state}
+
+        for key in self.temp_state:
+            self.temp_state[key] += tau * (targets[key] - self.temp_state[key])
+            self.temp_state[key] += self.rng.normal(0, 0.3)
+
+        return self.temp_state
+
+    def _simulate_vibration(self, severity: float) -> tuple:
+        """
+        Build vibration spectrum from physical components.
+
+        Healthy: shaft harmonics at low amplitude, noise floor.
+        Degraded: BPFO peak grows, develops shaft-frequency sidebands,
+                  broadband noise rises.
+        """
+        pcfg = self.pcfg
+        freq_axis = np.linspace(0, pcfg.vib_max_freq_hz, pcfg.vib_n_fft_bins)
+        spectrum = np.zeros(pcfg.vib_n_fft_bins, dtype=np.float32)
+
+        shaft = self.freqs["shaft"]
+
+        def add_peak(freq, amp, width=3.0):
+            if 0 < freq < pcfg.vib_max_freq_hz:
+                spectrum[:] += amp * np.exp(-0.5 * ((freq_axis - freq) / width) ** 2)
+
+        # 1x shaft (always present, grows with imbalance)
+        add_peak(shaft, 0.15 + severity * 0.3, width=2.0)
+        # 2x shaft (misalignment proxy -- grows with bearing wear)
+        add_peak(2 * shaft, 0.05 + severity * 0.15, width=2.0)
+
+        # BPFO and harmonics (the primary bearing defect indicator)
+        bpfo_amp = severity ** 1.5 * 0.8  # nonlinear growth (subtle then rapid)
+        for h in range(1, 4):
+            add_peak(self.freqs["BPFO"] * h, bpfo_amp / h, width=2.5)
+            # Shaft-frequency sidebands around BPFO (modulation from rotation)
+            if severity > 0.3:
+                sideband_amp = bpfo_amp * 0.3 * (severity - 0.3) / 0.7
+                add_peak(self.freqs["BPFO"] * h + shaft, sideband_amp / h, width=1.5)
+                add_peak(self.freqs["BPFO"] * h - shaft, sideband_amp / h, width=1.5)
+
+        # BPFI (inner race, lower amplitude contribution)
+        add_peak(self.freqs["BPFI"], severity ** 2 * 0.3, width=2.5)
+
+        # BSF (rolling element)
+        add_peak(self.freqs["BSF"], severity ** 2 * 0.2, width=2.0)
+
+        # FTF (cage)
+        add_peak(self.freqs["FTF"], severity ** 2 * 0.1, width=1.5)
+
+        # Vane pass frequency (cavitation indicator at high severity)
+        vpf = self.freqs["vane_pass"]
+        add_peak(vpf, 0.1 + severity * 0.2, width=3.0)
+
+        # Broadband noise floor rises with severity (random impacts)
+        noise_floor = 0.02 + severity * 0.08
+        spectrum += noise_floor * np.abs(self.rng.standard_normal(pcfg.vib_n_fft_bins))
+
+        spectrum = np.maximum(spectrum, 0)
+
+        # RMS velocity (mm/s) -- scale from normalised spectrum
+        # Healthy pump ~1.5 mm/s, alarm at 4.5, trip at 7.1
+        rms = 1.5 + severity * 6.0 + self.rng.normal(0, 0.2)
+        rms = max(rms, 0.1)
+
+        return spectrum.astype(np.float32), float(rms)
+
+    def _simulate_current(self, severity: float) -> tuple:
+        """
+        Motor current spectrum for MCSA.
+
+        Healthy: dominant 50 Hz fundamental + odd supply harmonics.
+        Degraded: broken-bar sidebands grow at f +/- 2sf, eccentricity sidebands appear.
+        """
+        pcfg = self.pcfg
+        freq_axis = np.linspace(0, pcfg.mcsa_max_freq_hz, pcfg.mcsa_n_fft_bins)
+        spectrum = np.zeros(pcfg.mcsa_n_fft_bins, dtype=np.float32)
+
+        def add_peak(freq, amp, width=0.3):
+            if 0 < freq < pcfg.mcsa_max_freq_hz:
+                spectrum[:] += amp * np.exp(-0.5 * ((freq_axis - freq) / width) ** 2)
+
+        # Supply fundamental (50 Hz) -- always dominant
+        add_peak(pcfg.supply_freq_hz, 1.0, width=0.5)
+
+        # Supply harmonics (3rd, 5th, 7th)
+        for h in [3, 5, 7]:
+            add_peak(pcfg.supply_freq_hz * h, 0.05 / h, width=0.4)
+
+        # Broken bar sidebands: severity controls amplitude relative to fundamental
+        # Healthy: -55 dB (~0.002). Severe: -25 dB (~0.056)
+        bar_amp = 0.002 + severity ** 2 * 0.06
+        for sb in self.mcsa_bars:
+            add_peak(sb, bar_amp, width=0.2)
+
+        # Eccentricity sidebands (from bearing wear causing rotor eccentricity)
+        ecc_amp = severity ** 1.5 * 0.03
+        for ef in self.mcsa_ecc:
+            add_peak(ef, ecc_amp, width=0.2)
+
+        # Noise floor
+        spectrum += 0.001 * np.abs(self.rng.standard_normal(pcfg.mcsa_n_fft_bins))
+        spectrum = np.maximum(spectrum, 0)
+
+        # RMS current (amps) -- rises slightly with mechanical degradation
+        cur_rms = 12.0 + severity * 3.0 + self.rng.normal(0, 0.1)
+
+        return spectrum.astype(np.float32), float(cur_rms)
+
+
+# ============================================================================
+#  PUMP HEALTH ANALYZER
+# ============================================================================
+
+class PumpHealthAnalyzer:
+    """
+    Analyses pump sensor data across three modalities and produces a
+    composite health index.
+
+    Each modality returns a health score (1.0 = healthy, 0.0 = failed).
+    Scores are fused with configurable weights, with a critical-override
+    rule: if any single modality is below 0.2, composite is clamped to 0.3.
+    """
+
+    def __init__(self, pcfg: PumpHealthConfig):
+        self.pcfg = pcfg
+
+        # Pre-compute characteristic frequencies for spectral lookup
+        self.freqs = PumpPhysics.bearing_defect_freqs(
+            pcfg.pump_rpm, pcfg.n_balls, pcfg.ball_diameter_mm,
+            pcfg.pitch_diameter_mm, pcfg.contact_angle_deg,
+        )
+        self.mcsa_bars = PumpPhysics.mcsa_broken_bar_sidebands(
+            pcfg.supply_freq_hz, pcfg.slip_nominal,
+        )
+
+        # EMA baselines for temperatures
+        self.temp_ema = {
+            "bearing_de": pcfg.temp_bearing_de_nominal,
+            "bearing_nde": pcfg.temp_bearing_nde_nominal,
+            "winding": pcfg.temp_winding_nominal,
+            "seal": pcfg.temp_seal_nominal,
+        }
+        self.temp_ema_alpha = 0.02
+
+        # Last known health (held during pump-off periods)
+        self.last_health = 1.0
+        self.last_vib_result = None
+        self.last_temp_result = None
+        self.last_mcsa_result = None
+        self.last_diagnosis = "Healthy"
+        self.n_updates = 0
+
+    def analyze(self, readings: dict) -> dict:
+        """
+        Full analysis pass. Returns dict with per-modality results,
+        composite health index, and fault diagnosis.
+        """
+        if not readings["pump_running"]:
+            # Hold last known health during off periods
+            return {
+                "vibration": self.last_vib_result or {"vibration_health": 1.0},
+                "temperature": self.last_temp_result or {"temperature_health": 1.0},
+                "mcsa": self.last_mcsa_result or {"mcsa_health": 1.0},
+                "health_index": self.last_health,
+                "diagnosis": self.last_diagnosis,
+                "pump_running": False,
+            }
+
+        self.n_updates += 1
+
+        vib = self._analyze_vibration(readings)
+        temp = self._analyze_temperature(readings["temperatures"])
+        mcsa = self._analyze_mcsa(readings)
+        health = self._compute_health_index(vib, temp, mcsa)
+        diagnosis = self._diagnose(vib, temp, mcsa)
+
+        self.last_vib_result = vib
+        self.last_temp_result = temp
+        self.last_mcsa_result = mcsa
+        self.last_health = health
+        self.last_diagnosis = diagnosis
+
+        return {
+            "vibration": vib,
+            "temperature": temp,
+            "mcsa": mcsa,
+            "health_index": health,
+            "diagnosis": diagnosis,
+            "pump_running": True,
+        }
+
+    def _analyze_vibration(self, readings: dict) -> dict:
+        """Score vibration spectrum for bearing defects and imbalance."""
+        pcfg = self.pcfg
+        spectrum = readings["vibration_spectrum"]
+        rms = readings["vibration_rms_mm_s"]
+        freq_axis = np.linspace(0, pcfg.vib_max_freq_hz, pcfg.vib_n_fft_bins)
+
+        def peak_amplitude_at(target_freq, tolerance_hz=5.0):
+            """Max spectral amplitude within tolerance of target frequency."""
+            mask = np.abs(freq_axis - target_freq) < tolerance_hz
+            if not np.any(mask):
+                return 0.0
+            return float(np.max(spectrum[mask]))
+
+        def local_noise(target_freq, band_hz=30.0):
+            """Median amplitude in a band around the target (excluding peak)."""
+            mask = (np.abs(freq_axis - target_freq) < band_hz) & \
+                   (np.abs(freq_axis - target_freq) > 8.0)
+            if not np.any(mask):
+                return 0.01
+            return float(np.median(spectrum[mask])) + 1e-6
+
+        # Bearing defect score: BPFO peak relative to local noise floor
+        bpfo_amp = peak_amplitude_at(self.freqs["BPFO"])
+        bpfo_noise = local_noise(self.freqs["BPFO"])
+        bpfo_snr = bpfo_amp / bpfo_noise
+        # SNR 1-3 = healthy, 3-8 = developing, 8+ = severe
+        bearing_score = min(max((bpfo_snr - 2.0) / 10.0, 0.0), 1.0)
+
+        # Imbalance score: 1x shaft amplitude
+        # Note: 1x shaft is always present in a running pump (SNR ~5-8 is normal).
+        # Only flag when it grows well above the healthy baseline.
+        shaft_amp = peak_amplitude_at(self.freqs["shaft"])
+        shaft_noise = local_noise(self.freqs["shaft"])
+        shaft_snr = shaft_amp / shaft_noise
+        imbalance_score = min(max((shaft_snr - 8.0) / 10.0, 0.0), 1.0)
+
+        # Overall RMS against ISO thresholds
+        if rms < pcfg.vib_alarm_mm_s:
+            rms_health = 1.0 - (rms / pcfg.vib_alarm_mm_s) * 0.3
+        elif rms < pcfg.vib_trip_mm_s:
+            frac = (rms - pcfg.vib_alarm_mm_s) / (pcfg.vib_trip_mm_s - pcfg.vib_alarm_mm_s)
+            rms_health = 0.7 - frac * 0.5
+        else:
+            rms_health = max(0.2 - (rms - pcfg.vib_trip_mm_s) / 10.0, 0.0)
+
+        # Composite vibration health: worst of bearing/imbalance/rms
+        vibration_health = max(1.0 - max(bearing_score, imbalance_score), rms_health)
+        vibration_health = min(vibration_health, rms_health)
+
+        return {
+            "bearing_score": bearing_score,
+            "imbalance_score": imbalance_score,
+            "bpfo_snr": bpfo_snr,
+            "rms_mm_s": rms,
+            "rms_health": rms_health,
+            "vibration_health": max(vibration_health, 0.0),
+        }
+
+    def _analyze_temperature(self, temps: dict) -> dict:
+        """Score temperatures against alarm/trip deltas with rate-of-rise."""
+        pcfg = self.pcfg
+
+        nominals = {
+            "bearing_de": pcfg.temp_bearing_de_nominal,
+            "bearing_nde": pcfg.temp_bearing_nde_nominal,
+            "winding": pcfg.temp_winding_nominal,
+            "seal": pcfg.temp_seal_nominal,
+        }
+
+        scores = {}
+        max_delta = 0.0
+        for key in nominals:
+            delta = temps[key] - nominals[key]
+            max_delta = max(max_delta, delta)
+            # Score: 0 delta = 1.0, alarm delta = 0.4, trip delta = 0.1
+            if delta <= 0:
+                scores[key] = 1.0
+            elif delta < pcfg.temp_alarm_delta:
+                scores[key] = 1.0 - 0.6 * (delta / pcfg.temp_alarm_delta)
+            elif delta < pcfg.temp_trip_delta:
+                frac = (delta - pcfg.temp_alarm_delta) / (pcfg.temp_trip_delta - pcfg.temp_alarm_delta)
+                scores[key] = 0.4 - 0.3 * frac
+            else:
+                scores[key] = max(0.1 - (delta - pcfg.temp_trip_delta) / 20.0, 0.0)
+
+            # Update EMA for rate-of-rise detection
+            self.temp_ema[key] = (1 - self.temp_ema_alpha) * self.temp_ema[key] + self.temp_ema_alpha * temps[key]
+
+        temperature_health = min(scores.values())
+
+        return {
+            "bearing_de_score": scores["bearing_de"],
+            "bearing_nde_score": scores["bearing_nde"],
+            "winding_score": scores["winding"],
+            "seal_score": scores["seal"],
+            "max_delta_above_nominal": max_delta,
+            "temperature_health": temperature_health,
+        }
+
+    def _analyze_mcsa(self, readings: dict) -> dict:
+        """Score motor current spectrum for broken bars and eccentricity."""
+        pcfg = self.pcfg
+        spectrum = readings["current_spectrum"]
+        freq_axis = np.linspace(0, pcfg.mcsa_max_freq_hz, pcfg.mcsa_n_fft_bins)
+
+        def peak_at(freq, tol_hz=0.3):
+            mask = np.abs(freq_axis - freq) < tol_hz
+            if not np.any(mask):
+                return 1e-6
+            return float(np.max(spectrum[mask]))
+
+        def noise_floor_at(freq, band_hz=2.0, exclude_hz=0.5):
+            """Median amplitude near target, excluding the peak itself."""
+            mask = (np.abs(freq_axis - freq) < band_hz) & \
+                   (np.abs(freq_axis - freq) > exclude_hz)
+            if not np.any(mask):
+                return 1e-4
+            return float(np.median(spectrum[mask])) + 1e-6
+
+        # Fundamental amplitude
+        fund_amp = peak_at(pcfg.supply_freq_hz) + 1e-6
+
+        # Broken bar sideband ratio: measure peak ABOVE local noise floor
+        # This eliminates false positives from the fundamental's spectral tail
+        sb_excess = []
+        for sb in self.mcsa_bars[:2]:  # first pair +/- 2sf
+            peak = peak_at(sb)
+            noise = noise_floor_at(sb)
+            sb_excess.append(max(peak - noise, 1e-6))
+        avg_sb_excess = np.mean(sb_excess) if sb_excess else 1e-6
+        sideband_ratio_db = 20.0 * math.log10(max(avg_sb_excess / fund_amp, 1e-10))
+
+        # Score: < -50 dB healthy, -40 to -35 developing, > -30 severe
+        if sideband_ratio_db < -50.0:
+            broken_bar_score = 0.0
+        elif sideband_ratio_db < -30.0:
+            broken_bar_score = (sideband_ratio_db + 50.0) / 20.0
+        else:
+            broken_bar_score = 1.0
+
+        # Eccentricity: check sidebands (also noise-floor corrected)
+        ecc_excess = []
+        ecc_freqs = PumpPhysics.mcsa_eccentricity_freqs(
+            pcfg.supply_freq_hz, pcfg.slip_nominal, pcfg.pump_poles)
+        for ef in ecc_freqs:
+            peak = peak_at(ef)
+            noise = noise_floor_at(ef)
+            ecc_excess.append(max(peak - noise, 1e-6))
+        avg_ecc_excess = np.mean(ecc_excess) if ecc_excess else 1e-6
+        ecc_ratio_db = 20.0 * math.log10(max(avg_ecc_excess / fund_amp, 1e-10))
+        eccentricity_score = min(max((ecc_ratio_db + 45.0) / 20.0, 0.0), 1.0)
+
+        mcsa_health = 1.0 - max(broken_bar_score, eccentricity_score)
+
+        return {
+            "broken_bar_score": broken_bar_score,
+            "eccentricity_score": eccentricity_score,
+            "sideband_ratio_db": sideband_ratio_db,
+            "mcsa_health": max(mcsa_health, 0.0),
+        }
+
+    def _compute_health_index(self, vib: dict, temp: dict, mcsa: dict) -> float:
+        """Weighted fusion with critical-override rule."""
+        pcfg = self.pcfg
+        vh = vib["vibration_health"]
+        th = temp["temperature_health"]
+        mh = mcsa["mcsa_health"]
+
+        health = (pcfg.health_weight_vibration * vh +
+                  pcfg.health_weight_temperature * th +
+                  pcfg.health_weight_mcsa * mh)
+
+        # Critical override: any single modality near-failure caps the composite
+        if min(vh, th, mh) < 0.2:
+            health = min(health, 0.3)
+
+        return max(min(health, 1.0), 0.0)
+
+    def _diagnose(self, vib: dict, temp: dict, mcsa: dict) -> str:
+        """Human-readable fault diagnosis from modality scores."""
+        faults = []
+
+        if vib["bearing_score"] > 0.5:
+            faults.append("Bearing outer race defect")
+        if vib["imbalance_score"] > 0.5:
+            faults.append("Mechanical imbalance")
+        if temp["max_delta_above_nominal"] > self.pcfg.temp_alarm_delta:
+            faults.append(f"Overtemperature (+{temp['max_delta_above_nominal']:.0f}C)")
+        if mcsa["broken_bar_score"] > 0.5:
+            faults.append("Broken rotor bar(s)")
+        if mcsa["eccentricity_score"] > 0.5:
+            faults.append("Rotor eccentricity")
+
+        return " | ".join(faults) if faults else "Healthy"
+
+
 def _ring_distance(pos_a: float, pos_b: float, ring_len: float) -> float:
     """Shortest path distance between two points on a ring."""
     d = abs(pos_a - pos_b)
@@ -2630,12 +3245,478 @@ def run_mesh_demo():
 
 
 # ============================================================================
+#  10. PUMP HEALTH MONITORING DEMO
+# ============================================================================
+
+def run_pump_health_demo():
+    """
+    Pump health monitoring demo on the fire ring main jockey pump.
+
+    Runs the full 6-node mesh with progressive pump degradation:
+    1. Healthy operation (0-300)
+    2. Bearing wear onset -- BPFO peak grows, temps rise (300-600)
+    3. Moderate degradation -- alarm thresholds approached (600-750)
+    4. Severe degradation -- trip thresholds, pressure can't maintain (750-900)
+    5. Pump trip at t=900 -- pressure drops, fire pump auto-starts at t=920
+    6. Post-event stabilisation (920-1200)
+
+    Generates a 9-panel plot covering pipe pressure, gossip, CfC,
+    pump health index, vibration waterfall, temperatures, and MCSA.
+    """
+    mcfg = MeshConfig(demo_length=1200)
+    pcfg = PumpHealthConfig()
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    console.rule("[bold magenta]SAIREN Guardian -- Pump Health Monitoring[/bold magenta]")
+    console.print("6-node fire ring main + jockey pump tri-modal health analysis\n")
+
+    # -- Step 1: Create mesh ---------------------------------------------------
+    console.rule("[cyan]Step 1: Create Mesh Network[/cyan]")
+    mesh = MeshNetwork(mcfg)
+    mesh.create_nodes()
+    for i, node in enumerate(mesh.nodes):
+        label = mcfg.node_labels[i]
+        extra = " [bold yellow]+ PUMP HEALTH[/bold yellow]" if i == 1 else ""
+        console.print(f"  Node {i} [{label}]: pos={mcfg.node_positions[i]:.0f}m, "
+                       f"section={mcfg.section_lengths[i]:.1f}m{extra}")
+
+    # -- Step 2: Train shared encoder ------------------------------------------
+    console.rule("[cyan]Step 2: Train Shared Encoder[/cyan]")
+    history = mesh.train_shared_encoder()
+
+    # -- Step 3: Initialise pump health subsystem ------------------------------
+    console.rule("[cyan]Step 3: Initialise Pump Health Subsystem[/cyan]")
+    pump_sim = PumpSensorSimulator(pcfg)
+    pump_analyzer = PumpHealthAnalyzer(pcfg)
+
+    # Print characteristic frequencies
+    freqs = pump_sim.freqs
+    console.print(f"  Shaft frequency: {freqs['shaft']:.1f} Hz")
+    console.print(f"  BPFO: {freqs['BPFO']:.1f} Hz  |  BPFI: {freqs['BPFI']:.1f} Hz  |  "
+                   f"BSF: {freqs['BSF']:.1f} Hz  |  FTF: {freqs['FTF']:.1f} Hz")
+    console.print(f"  Vane pass: {freqs['vane_pass']:.1f} Hz")
+    bars = pump_sim.mcsa_bars
+    console.print(f"  MCSA broken-bar sidebands: {bars[0]:.2f}, {bars[1]:.2f} Hz (1st pair)")
+
+    # -- Step 4: Stream with pump degradation ----------------------------------
+    console.rule("[cyan]Step 4: Online Streaming with Pump Degradation[/cyan]")
+
+    # Modified pressure simulator: pump health affects recovery
+    sim = SpatialPressureSimulator(mcfg)
+
+    N = mcfg.demo_length
+    nn = mcfg.n_nodes
+    true_p = np.zeros((N, nn))
+    pred_p = np.zeros((N, nn))
+    anom_s = np.zeros((N, nn))
+    cfc_surprise = np.zeros(N)
+
+    # Pump health tracking arrays
+    pump_health = np.zeros(N)
+    pump_severity = np.zeros(N)
+    pump_vib_rms = np.zeros(N)
+    pump_temp_de = np.zeros(N)
+    pump_temp_nde = np.zeros(N)
+    pump_temp_winding = np.zeros(N)
+    pump_temp_seal = np.zeros(N)
+    pump_mcsa_sb_db = np.zeros(N)
+    pump_running_arr = np.zeros(N, dtype=bool)
+    pump_vib_spectra = np.zeros((N, pcfg.vib_n_fft_bins))  # for waterfall plot
+
+    gossip_log = []
+    pump_events = []  # pump-specific event log
+
+    # Build table
+    table = Table(title="Pump Health Monitoring + Gossip Consensus")
+    table.add_column("t", justify="right", style="cyan", width=5)
+    table.add_column("P(N1)", justify="right", width=7)
+    table.add_column("Health", justify="right", width=7)
+    table.add_column("Sev", justify="right", width=5)
+    table.add_column("VibRMS", justify="right", width=7)
+    table.add_column("TempDE", justify="right", width=7)
+    table.add_column("MCSA dB", justify="right", width=8)
+    table.add_column("Diagnosis", style="bold", width=35)
+    table.add_column("Gossip", style="bold", width=30)
+
+    print_interval = 20
+
+    for t in range(N):
+        # Get pump severity and modify pressure dynamics accordingly
+        severity = pump_sim.get_severity(t)
+        pump_severity[t] = severity
+
+        # Pump health affects pressure recovery: degraded pump = slower fill
+        pressures = sim.get_pressures(t)
+
+        # After pump trip, pressure slowly decays (no jockey pump)
+        if t >= pcfg.pump_trip_step and t < pcfg.fire_pump_start_step:
+            decay_rate = 0.5  # PSI per step
+            steps_since_trip = t - pcfg.pump_trip_step
+            for nid in pressures:
+                pressures[nid] -= decay_rate * steps_since_trip
+                pressures[nid] = max(pressures[nid], 100.0)
+        elif t >= pcfg.fire_pump_start_step:
+            # Fire pump restores to 145 PSI (slightly below jockey setpoint)
+            steps_since_fire = t - pcfg.fire_pump_start_step
+            target = 145.0
+            for nid in pressures:
+                current = pressures[nid]
+                pressures[nid] = current + (target - current) * min(steps_since_fire / 50.0, 1.0)
+
+        # Moderate degradation: jockey pump slower recovery from events
+        if 0.3 < severity < 1.0 and t < pcfg.pump_trip_step:
+            # Reduce pressure slightly (pump struggling)
+            pressure_penalty = severity * 5.0
+            for nid in pressures:
+                pressures[nid] -= pressure_penalty
+
+        # Mesh step (all nodes process pipe pressure)
+        result = mesh.step(t, pressures)
+
+        for nid in range(nn):
+            r = result["readings"][nid]
+            true_p[t, nid] = r["true_psi"]
+            pred_p[t, nid] = r["pred_psi"]
+            anom_s[t, nid] = r["anomaly_score"]
+        cfc_surprise[t] = result["cfc_surprise"]
+
+        # Pump health analysis (runs independently of pipe ARS)
+        pump_readings = pump_sim.get_readings(t)
+        pump_result = pump_analyzer.analyze(pump_readings)
+
+        pump_health[t] = pump_result["health_index"]
+        pump_running_arr[t] = pump_readings["pump_running"]
+        pump_vib_rms[t] = pump_readings["vibration_rms_mm_s"]
+        pump_vib_spectra[t] = pump_readings["vibration_spectrum"]
+        pump_temp_de[t] = pump_readings["temperatures"]["bearing_de"]
+        pump_temp_nde[t] = pump_readings["temperatures"]["bearing_nde"]
+        pump_temp_winding[t] = pump_readings["temperatures"]["winding"]
+        pump_temp_seal[t] = pump_readings["temperatures"]["seal"]
+        if pump_result["mcsa"]["sideband_ratio_db"] is not None:
+            pump_mcsa_sb_db[t] = pump_result["mcsa"]["sideband_ratio_db"]
+
+        # Track pump health events
+        health = pump_result["health_index"]
+        diag = pump_result["diagnosis"]
+        if health < 0.7 and (not pump_events or pump_events[-1]["health"] >= 0.7):
+            pump_events.append({"t": t, "type": "ALARM", "health": health, "diagnosis": diag})
+        if health < 0.4 and (not pump_events or pump_events[-1].get("type") != "CRITICAL"):
+            pump_events.append({"t": t, "type": "CRITICAL", "health": health, "diagnosis": diag})
+        if t == pcfg.pump_trip_step:
+            pump_events.append({"t": t, "type": "TRIP", "health": health, "diagnosis": diag})
+
+        # Gossip events
+        gossip_str = ""
+        for ev in result["gossip_events"]:
+            origin = ev["origin"]
+            verdict = ev["verdict"]
+            original = ev.get("original_verdict", verdict)
+            d = ev["detail"]
+            label = mcfg.node_labels[origin]
+            override_tag = ""
+            if original != verdict:
+                override_tag = f" (CfC: {original[0]}->{verdict[0]})"
+            if d["system_wide"]:
+                gossip_str = f"[bold red]SYS-WIDE[/bold red]{override_tag}"
+            elif verdict == "CONFIRMED":
+                gossip_str = f"[red]CONF[/red] N{origin}{override_tag}"
+            else:
+                gossip_str = f"[green]DENY[/green] N{origin}{override_tag}"
+            gossip_log.append(ev)
+
+        # Table output
+        is_event = (t == pcfg.degradation_start or t == pcfg.pump_trip_step
+                     or t == pcfg.fire_pump_start_step or gossip_str)
+        if t % print_interval == 0 or is_event:
+            # Health color coding
+            h = pump_health[t]
+            if h > 0.7:
+                h_str = f"[green]{h:.2f}[/green]"
+            elif h > 0.4:
+                h_str = f"[yellow]{h:.2f}[/yellow]"
+            else:
+                h_str = f"[bold red]{h:.2f}[/bold red]"
+
+            # Severity
+            s_str = f"{severity:.2f}"
+
+            # Vibration RMS color
+            vrms = pump_vib_rms[t]
+            if vrms < pcfg.vib_alarm_mm_s:
+                v_str = f"{vrms:.1f}"
+            elif vrms < pcfg.vib_trip_mm_s:
+                v_str = f"[yellow]{vrms:.1f}[/yellow]"
+            else:
+                v_str = f"[bold red]{vrms:.1f}[/bold red]"
+
+            # Temp DE
+            td = pump_temp_de[t]
+            delta_de = td - pcfg.temp_bearing_de_nominal
+            if delta_de < pcfg.temp_alarm_delta:
+                td_str = f"{td:.0f}"
+            elif delta_de < pcfg.temp_trip_delta:
+                td_str = f"[yellow]{td:.0f}[/yellow]"
+            else:
+                td_str = f"[bold red]{td:.0f}[/bold red]"
+
+            # MCSA sideband ratio
+            sb = pump_mcsa_sb_db[t]
+            if sb > -40:
+                sb_str = f"[bold red]{sb:.0f}[/bold red]"
+            elif sb > -50:
+                sb_str = f"[yellow]{sb:.0f}[/yellow]"
+            else:
+                sb_str = f"{sb:.0f}"
+
+            # Diagnosis (truncated)
+            diag_str = diag[:33] if len(diag) > 33 else diag
+            if "Healthy" not in diag:
+                diag_str = f"[red]{diag_str}[/red]"
+
+            table.add_row(str(t), f"{true_p[t, 1]:.0f}", h_str, s_str,
+                          v_str if pump_running_arr[t] else "[dim]OFF[/dim]",
+                          td_str, sb_str if pump_running_arr[t] else "[dim]--[/dim]",
+                          diag_str, gossip_str or "[dim]--[/dim]")
+
+    console.print(table)
+
+    # -- Step 5: Results --------------------------------------------------------
+    console.rule("[cyan]Results Summary[/cyan]")
+
+    # Pump health timeline
+    for ev in pump_events:
+        style = {"ALARM": "yellow", "CRITICAL": "bold red", "TRIP": "bold red on white"}.get(ev["type"], "white")
+        console.print(f"  [{style}]t={ev['t']}: {ev['type']} -- health={ev['health']:.2f} -- {ev['diagnosis']}[/{style}]")
+
+    # Gossip summary
+    confirmed = [e for e in gossip_log if e["verdict"] == "CONFIRMED"]
+    denied = [e for e in gossip_log if e["verdict"] == "DENIED"]
+    console.print(f"\n  Gossip rounds: {len(gossip_log)} total, "
+                   f"[red]{len(confirmed)} confirmed[/red], "
+                   f"[green]{len(denied)} denied[/green]")
+
+    # CfC Judge summary
+    judge = mesh.judge
+    console.print(f"  CfC Judge: {judge.n_reviews} reviewed, "
+                   f"[magenta]{judge.n_overrides} overrides[/magenta]")
+
+    # Pump health at key moments
+    console.print(f"\n  Pump health at degradation start (t={pcfg.degradation_start}): "
+                   f"{pump_health[pcfg.degradation_start]:.2f}")
+    console.print(f"  Pump health at trip (t={pcfg.pump_trip_step}): "
+                   f"{pump_health[min(pcfg.pump_trip_step, N-1)]:.2f}")
+    console.print(f"  Final bearing DE temp: {pump_temp_de[min(pcfg.pump_trip_step, N-1)]:.1f} C "
+                   f"(nominal: {pcfg.temp_bearing_de_nominal:.0f} C)")
+    console.print(f"  Final vibration RMS: {pump_vib_rms[min(pcfg.pump_trip_step-1, N-1)]:.1f} mm/s "
+                   f"(alarm: {pcfg.vib_alarm_mm_s}, trip: {pcfg.vib_trip_mm_s})")
+
+    # -- Step 6: Plots ----------------------------------------------------------
+    console.rule("[cyan]Generating Pump Health Plots[/cyan]")
+
+    node_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+    t_axis = np.arange(N)
+
+    fig, axes = plt.subplots(5, 2, figsize=(20, 28), dpi=100)
+
+    # (a) Spatial pressure -- all 6 nodes
+    ax = axes[0, 0]
+    for nid in range(nn):
+        ax.plot(t_axis, true_p[:, nid], color=node_colors[nid], alpha=0.7, lw=0.8,
+                label=f"N{nid} {mcfg.node_labels[nid]}")
+    ax.axvline(pcfg.degradation_start, color="orange", ls=":", alpha=0.7, label="Degradation onset")
+    ax.axvline(pcfg.pump_trip_step, color="red", ls="--", alpha=0.7, label="Pump trip")
+    ax.axvline(pcfg.fire_pump_start_step, color="blue", ls="--", alpha=0.7, label="Fire pump start")
+    if mcfg.local_leak_time < N:
+        ax.axvspan(mcfg.local_leak_time, mcfg.local_leak_time + mcfg.local_leak_duration,
+                   alpha=0.1, color="orange")
+    ax.set_ylabel("Pressure (PSI)")
+    ax.set_title("(a) Spatial Pressure Distribution")
+    ax.legend(loc="upper right", fontsize=6, ncol=3)
+    ax.grid(True, alpha=0.3)
+
+    # (b) Pump health index
+    ax = axes[0, 1]
+    ax.fill_between(t_axis, pump_health, alpha=0.3, color="green", where=pump_health > 0.7)
+    ax.fill_between(t_axis, pump_health, alpha=0.3, color="orange", where=(pump_health > 0.4) & (pump_health <= 0.7))
+    ax.fill_between(t_axis, pump_health, alpha=0.3, color="red", where=pump_health <= 0.4)
+    ax.plot(t_axis, pump_health, color="black", lw=1.0)
+    ax.plot(t_axis, pump_severity, color="gray", ls="--", lw=0.8, alpha=0.5, label="Fault severity")
+    ax.axhline(0.7, color="orange", ls=":", alpha=0.5, label="Alarm")
+    ax.axhline(0.4, color="red", ls=":", alpha=0.5, label="Critical")
+    ax.axvline(pcfg.pump_trip_step, color="red", ls="--", alpha=0.7, label="Pump trip")
+    ax.set_ylabel("Health Index / Severity")
+    ax.set_title("(b) Pump Health Index (composite)")
+    ax.legend(loc="upper right", fontsize=7)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(-0.05, 1.05)
+
+    # (c) Vibration RMS
+    ax = axes[1, 0]
+    running_mask = pump_running_arr & (pump_vib_rms > 0.1)
+    ax.scatter(t_axis[running_mask], pump_vib_rms[running_mask], s=2, c=pump_vib_rms[running_mask],
+               cmap="RdYlGn_r", vmin=1.0, vmax=8.0, alpha=0.7)
+    ax.axhline(pcfg.vib_alarm_mm_s, color="orange", ls="--", label=f"Alarm ({pcfg.vib_alarm_mm_s})")
+    ax.axhline(pcfg.vib_trip_mm_s, color="red", ls="--", label=f"Trip ({pcfg.vib_trip_mm_s})")
+    ax.axvline(pcfg.pump_trip_step, color="red", ls="--", alpha=0.5)
+    ax.set_ylabel("RMS Velocity (mm/s)")
+    ax.set_title("(c) Vibration RMS Trend (ISO 10816-3)")
+    ax.legend(loc="upper left", fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    # (d) Vibration spectrum waterfall
+    ax = axes[1, 1]
+    # Subsample for waterfall (every 5th running step)
+    wf_idx = np.where(running_mask)[0][::5]
+    if len(wf_idx) > 0:
+        wf_data = pump_vib_spectra[wf_idx]
+        vib_freq = np.linspace(0, pcfg.vib_max_freq_hz, pcfg.vib_n_fft_bins)
+        im = ax.pcolormesh(vib_freq[:200], wf_idx, wf_data[:, :200],
+                           cmap="hot", shading="auto")
+        # Mark characteristic frequencies
+        for name, freq in [("BPFO", pump_sim.freqs["BPFO"]),
+                           ("2x", pump_sim.freqs["shaft"] * 2)]:
+            if freq < vib_freq[199]:
+                ax.axvline(freq, color="cyan", ls="--", alpha=0.5, lw=0.5)
+                ax.text(freq + 2, wf_idx[-1] * 0.05, name, color="cyan", fontsize=6)
+        plt.colorbar(im, ax=ax, label="Amplitude")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Time Step")
+    ax.set_title("(d) Vibration Spectrum Waterfall")
+
+    # (e) Temperature trends
+    ax = axes[2, 0]
+    ax.plot(t_axis, pump_temp_de, color="red", lw=1.0, label="Bearing DE")
+    ax.plot(t_axis, pump_temp_nde, color="orange", lw=1.0, label="Bearing NDE")
+    ax.plot(t_axis, pump_temp_winding, color="purple", lw=1.0, label="Winding")
+    ax.plot(t_axis, pump_temp_seal, color="blue", lw=1.0, label="Seal")
+    ax.axhline(pcfg.temp_bearing_de_nominal + pcfg.temp_alarm_delta,
+               color="orange", ls="--", alpha=0.5, label=f"DE alarm ({pcfg.temp_bearing_de_nominal + pcfg.temp_alarm_delta:.0f}C)")
+    ax.axhline(pcfg.temp_bearing_de_nominal + pcfg.temp_trip_delta,
+               color="red", ls="--", alpha=0.5, label=f"DE trip ({pcfg.temp_bearing_de_nominal + pcfg.temp_trip_delta:.0f}C)")
+    ax.axvline(pcfg.pump_trip_step, color="red", ls="--", alpha=0.5)
+    ax.set_ylabel("Temperature (C)")
+    ax.set_title("(e) Temperature Trends")
+    ax.legend(loc="upper left", fontsize=6, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    # (f) MCSA sideband ratio
+    ax = axes[2, 1]
+    mcsa_mask = pump_running_arr & (pump_mcsa_sb_db < -5)
+    ax.scatter(t_axis[mcsa_mask], pump_mcsa_sb_db[mcsa_mask], s=2, color="#7b2d8e", alpha=0.7)
+    ax.axhline(-50, color="green", ls="--", alpha=0.5, label="Healthy (< -50 dB)")
+    ax.axhline(-35, color="orange", ls="--", alpha=0.5, label="Developing (-35 dB)")
+    ax.axhline(-25, color="red", ls="--", alpha=0.5, label="Severe (> -25 dB)")
+    ax.axvline(pcfg.pump_trip_step, color="red", ls="--", alpha=0.5)
+    ax.set_ylabel("Sideband/Fundamental (dB)")
+    ax.set_title("(f) MCSA Broken Bar Sideband Ratio")
+    ax.legend(loc="upper left", fontsize=7)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(-65, -15)
+
+    # (g) Per-node anomaly scores
+    ax = axes[3, 0]
+    for nid in range(nn):
+        ax.plot(t_axis, anom_s[:, nid], color=node_colors[nid], alpha=0.6, lw=0.7,
+                label=f"N{nid}")
+    ax.axhline(mcfg.gossip_trigger_threshold, color="gray", ls="--", alpha=0.5)
+    ax.axvline(pcfg.pump_trip_step, color="red", ls="--", alpha=0.5)
+    ax.set_ylabel("Anomaly Score")
+    ax.set_title("(g) Per-Node Anomaly Scores")
+    ax.legend(loc="upper right", fontsize=6, ncol=3)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(-0.05, 1.05)
+
+    # (h) Gossip consensus timeline
+    ax = axes[3, 1]
+    ax.set_xlim(0, N)
+    ax.set_ylim(-0.5, nn - 0.5)
+    ax.set_yticks(range(nn))
+    ax.set_yticklabels([f"N{i}" for i in range(nn)])
+    ax.set_title("(h) Gossip Consensus Timeline")
+    ax.grid(True, alpha=0.3)
+    for ev in mesh.event_log:
+        if ev["type"] == "GOSSIP_START":
+            ax.plot(ev["t"], ev["origin"], "o", color="orange", ms=4, zorder=5)
+        elif ev["type"] == "GOSSIP_RESULT":
+            color = "red" if ev["verdict"] == "CONFIRMED" else "green"
+            marker = "^" if ev["verdict"] == "CONFIRMED" else "v"
+            edge = "magenta" if ev.get("original_verdict") != ev["verdict"] else color
+            ax.plot(ev["t"], ev["origin"], marker, color=color, ms=6, zorder=5,
+                    markeredgecolor=edge, markeredgewidth=1.0)
+    ax.axvline(pcfg.pump_trip_step, color="red", ls="--", alpha=0.5)
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="orange", ms=6, label="Gossip Start"),
+        Line2D([0], [0], marker="^", color="w", markerfacecolor="red", ms=6, label="Confirmed"),
+        Line2D([0], [0], marker="v", color="w", markerfacecolor="green", ms=6, label="Denied"),
+    ]
+    ax.legend(handles=legend_elements, loc="upper right", fontsize=7)
+
+    # (i) CfC Judge surprise
+    ax = axes[4, 0]
+    ax.plot(t_axis, cfc_surprise, color="#7b2d8e", lw=0.8, alpha=0.9)
+    if len(mesh.judge.surprise_buffer) > 100:
+        buf = np.array(mesh.judge.surprise_buffer)
+        ax.axhline(np.percentile(buf, mcfg.cfc_surprise_high_pct), color="red",
+                   ls="--", alpha=0.5, label=f"High ({mcfg.cfc_surprise_high_pct}th pct)")
+    ax.axvline(pcfg.pump_trip_step, color="red", ls="--", alpha=0.5)
+    ax.set_xlabel("Time Step")
+    ax.set_ylabel("Surprise")
+    ax.set_title("(i) CfC Judge Surprise")
+    ax.legend(loc="upper right", fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    # (j) Combined health + pressure overlay
+    ax = axes[4, 1]
+    ax2 = ax.twinx()
+    ax.plot(t_axis, true_p[:, 1], color="#1f77b4", lw=0.8, alpha=0.7, label="Pump node pressure")
+    ax2.plot(t_axis, pump_health, color="red", lw=1.2, label="Pump health")
+    ax.set_xlabel("Time Step")
+    ax.set_ylabel("Pressure (PSI)", color="#1f77b4")
+    ax2.set_ylabel("Health Index", color="red")
+    ax.set_title("(j) Pressure vs Pump Health (Node 1)")
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = str(output_dir / "pump_health_results.png")
+    plt.savefig(plot_path, bbox_inches="tight")
+    plt.close()
+    console.print(f"  Saved pump health plot to {plot_path}")
+
+    # Save pump health state to JSON
+    pump_state = {
+        "config": {
+            "pump_rpm": pcfg.pump_rpm,
+            "bearing": f"{pcfg.n_balls} balls, {pcfg.ball_diameter_mm}mm dia, {pcfg.pitch_diameter_mm}mm pitch",
+            "characteristic_freqs": {k: round(v, 2) for k, v in pump_sim.freqs.items()},
+        },
+        "events": pump_events,
+        "final_health": float(pump_health[N - 1]),
+        "gossip_rounds": len(gossip_log),
+        "cfc_overrides": mesh.judge.n_overrides,
+    }
+    pump_json = str(output_dir / "pump_health_state.json")
+    with open(pump_json, "w") as f:
+        json.dump(pump_state, f, indent=2, default=str)
+    console.print(f"  Saved pump health state to {pump_json}")
+
+    console.rule("[bold green]Pump Health Demo Complete[/bold green]")
+
+
+# ============================================================================
 #  ENTRY POINT
 # ============================================================================
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--mesh":
         run_mesh_demo()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--pump":
+        run_pump_health_demo()
     else:
         run_demo()
-        console.print("\n[dim]Run with --mesh for 6-node gossip micro-mesh demo[/dim]")
+        console.print("\n[dim]Run with --mesh for 6-node gossip mesh demo[/dim]")
+        console.print("[dim]Run with --pump for pump health monitoring demo[/dim]")

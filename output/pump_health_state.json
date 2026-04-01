@@ -1,0 +1,43 @@
+{
+  "config": {
+    "pump_rpm": 2950.0,
+    "bearing": "9 balls, 7.938mm dia, 38.5mm pitch",
+    "characteristic_freqs": {
+      "shaft": 49.17,
+      "BPFO": 175.63,
+      "BPFI": 266.87,
+      "BSF": 114.16,
+      "FTF": 19.51,
+      "vane_pass": 295.0
+    }
+  },
+  "events": [
+    {
+      "t": 657,
+      "type": "ALARM",
+      "health": 0.6533526207194756,
+      "diagnosis": "Bearing outer race defect"
+    },
+    {
+      "t": 819,
+      "type": "CRITICAL",
+      "health": 0.3896334289153322,
+      "diagnosis": "Bearing outer race defect | Rotor eccentricity"
+    },
+    {
+      "t": 900,
+      "type": "TRIP",
+      "health": 0.2903542986759303,
+      "diagnosis": "Bearing outer race defect | Rotor eccentricity"
+    },
+    {
+      "t": 901,
+      "type": "CRITICAL",
+      "health": 0.2903542986759303,
+      "diagnosis": "Bearing outer race defect | Rotor eccentricity"
+    }
+  ],
+  "final_health": 0.2903542986759303,
+  "gossip_rounds": 47,
+  "cfc_overrides": 34
+}

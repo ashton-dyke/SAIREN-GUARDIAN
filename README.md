@@ -4,7 +4,7 @@
 
 SAIREN Guardian is a self-contained prototype for edge-native acoustic pressure estimation and anomaly detection on fluid-filled pipe systems. It was designed for offshore fire ring mains but the physics and architecture generalise to any fluid-filled piping (drilling risers, process lines, subsea flowlines).
 
-Everything -- data generation, model training, online learning, six-node gossip mesh, CfC temporal arbiter, plotting, and serialisation -- lives in one file (`ars_pisnn_prototype.py`, ~2,600 lines) with zero GPU dependencies. It runs on a Raspberry Pi 5.
+Everything -- data generation, model training, online learning, six-node gossip mesh, CfC temporal arbiter, pump health monitoring, plotting, and serialisation -- lives in one file (`ars_pisnn_prototype.py`, ~3,800 lines) with zero GPU dependencies. It runs on a Raspberry Pi 5.
 
 ---
 
@@ -17,9 +17,11 @@ Everything -- data generation, model training, online learning, six-node gossip 
   - [Layer 0 -- Physics-Informed SNN (PI-SNN)](#layer-0----physics-informed-snn-pi-snn)
   - [Layer 1 -- Gossip Micro-Mesh](#layer-1----gossip-micro-mesh)
   - [Layer 2 -- CfC Judge](#layer-2----cfc-judge)
+  - [Pump Health Monitoring](#pump-health-monitoring)
 - [Demo Scenarios](#demo-scenarios)
   - [Single-Node Demo](#single-node-demo)
   - [Mesh Demo](#mesh-demo)
+  - [Pump Health Demo](#pump-health-demo)
 - [Results](#results)
 - [File Structure](#file-structure)
 - [Configuration](#configuration)
@@ -40,9 +42,12 @@ python ars_pisnn_prototype.py
 
 # Run the 6-node gossip mesh demo (fire ring main, 120-220 PSI)
 python ars_pisnn_prototype.py --mesh
+
+# Run the pump health monitoring demo (jockey pump degradation + mesh)
+python ars_pisnn_prototype.py --pump
 ```
 
-Both demos are fully self-contained. They generate synthetic data, train models, stream inference with anomaly injection, and produce plots in `output/`.
+All demos are fully self-contained. They generate synthetic data, train models, stream inference with anomaly injection, and produce plots in `output/`.
 
 ---
 
@@ -232,6 +237,63 @@ The surprise score is tracked in a rolling buffer (500 samples). Percentile thre
 | DENIED | Very high surprise (> 1.5x high threshold) | **CONFIRMED** | Potential missed event -- CfC sees something the gossip doesn't |
 | DENIED | Normal surprise | DENIED | Agrees with gossip |
 
+### Pump Health Monitoring
+
+A tri-modal condition monitoring system for the jockey pump (Node 1, pump discharge). It fuses vibration analysis, temperature trending, and Motor Current Signature Analysis (MCSA) into a composite health index that feeds into the gossip mesh.
+
+**Why the jockey pump matters:** On an offshore fire ring main, the jockey pump runs almost continuously to maintain static pressure and compensate for minor leaks. It's the most mechanically stressed component in the loop. If it fails silently, the ring main depressurises gradually -- a condition the pressure sensors will eventually detect, but only after the situation has progressed. Monitoring the pump directly catches degradation weeks before it becomes a pressure event.
+
+**Sensor suite (all non-invasive):**
+
+| Sensor | Mounting | Sample rate | Measures |
+|--------|----------|-------------|----------|
+| Accelerometer | Bearing housing (DE/NDE) | 2 kHz | Vibration spectrum |
+| RTD/thermocouple | Bearing housing, motor winding, seal | 1 Hz | Temperature trends |
+| Current clamp | Motor supply cable | 2 kHz | Motor current spectrum |
+
+**Vibration analysis:**
+
+The vibration analyzer computes bearing defect frequencies from first principles using the 6205 bearing geometry (9 balls, 7.938 mm ball diameter, 38.5 mm pitch diameter, 0° contact angle):
+
+| Frequency | Formula | Value (2950 RPM) |
+|-----------|---------|-------------------|
+| BPFO (outer race) | `(n/2) * f_s * (1 - Bd/Pd * cos(α))` | 175.6 Hz |
+| BPFI (inner race) | `(n/2) * f_s * (1 + Bd/Pd * cos(α))` | 266.9 Hz |
+| BSF (ball spin) | `(Pd/2Bd) * f_s * (1 - (Bd/Pd)^2 * cos²(α))` | 114.2 Hz |
+| FTF (cage) | `(f_s/2) * (1 - Bd/Pd * cos(α))` | 19.5 Hz |
+
+BPFO peaks are monitored for signal-to-noise ratio against the local noise floor. Shaft-frequency harmonics (1x, 2x) indicate imbalance -- but since 1x is always present in a running pump (healthy SNR ~5-8), the threshold is set high (SNR > 8.0) to avoid false alarms. Overall vibration severity follows ISO 10816-3 (Group 2, rigid mounting): alarm at 4.5 mm/s RMS, trip at 7.1 mm/s.
+
+**Temperature analysis:**
+
+Four temperature channels (DE bearing, NDE bearing, motor winding, seal) are compared against nominal baselines. Scoring uses delta-from-nominal with alarm (+15°C) and trip (+25°C) thresholds. Temperature evolution includes thermal time constants (~200 s for bearings, ~150 s for winding) to model realistic lag.
+
+**Motor Current Signature Analysis (MCSA):**
+
+The motor current spectrum is analyzed for:
+
+- **Broken rotor bars:** Sidebands at `f_line ± 2*s*f_line` (48.3/51.7 Hz for 50 Hz supply, slip=0.017). Sideband-to-fundamental ratio > -40 dB indicates fault.
+- **Eccentricity:** Sidebands at `f_line ± f_shaft` (1.3/98.7 Hz). Indicates air gap non-uniformity from bearing wear.
+
+A noise-floor correction subtracts the median amplitude in a band around each sideband frequency (excluding the peak itself) before computing ratios. This eliminates false positives from the 50 Hz fundamental's spectral leakage into nearby bins.
+
+**Composite health index:**
+
+```
+health = 0.4 * vibration + 0.3 * temperature + 0.3 * mcsa
+```
+
+With a critical-override rule: if any single modality score drops below 0.2, the composite is capped at 0.3 regardless of the weighted sum. This prevents a critically failed subsystem from being masked by healthy readings on the other two channels.
+
+| Health range | Status | Action |
+|-------------|--------|--------|
+| 0.65 - 1.0 | Healthy | Normal operation |
+| 0.40 - 0.65 | Alarm | Schedule inspection |
+| 0.20 - 0.40 | Critical | Plan maintenance |
+| 0.00 - 0.20 | Trip | Auto-shutdown, start fire pump |
+
+**Mesh integration:** When the pump trips, the pressure dynamics at Node 1 change -- discharge pressure drops to ambient, and the fire pump auto-starts 20 steps later with a different pressure profile. These pressure transients propagate through the gossip mesh and CfC judge, testing the full system's ability to distinguish pump failure from pipe failure.
+
 ---
 
 ## Demo Scenarios
@@ -291,6 +353,44 @@ Simulates 6 ARS sensors on a fire ring main (120-220 PSI, seawater):
 | (d) | Gossip Consensus Timeline | Orange circles = gossip start, red triangles = confirmed, green = denied. Magenta edge = CfC override |
 | (e) | CfC Judge Surprise | CfC prediction surprise over time. Green diamonds = CONFIRMED->DENIED overrides. Red/green dashed lines = high/low surprise thresholds |
 
+### Pump Health Demo
+
+```bash
+python ars_pisnn_prototype.py --pump
+```
+
+Simulates the jockey pump degrading over 1,200 timesteps while the full 6-node mesh runs concurrently:
+
+| Phase | Time steps | What happens |
+|-------|-----------|--------------|
+| Jockey fill | 0-200 | Pressure ramps 130 -> 150 PSI, pump healthy |
+| Normal static | 200-300 | Stable at 150 PSI, all systems nominal |
+| **Degradation onset** | 300-900 | Linear severity ramp 0.0 -> 1.0 (bearing wear, winding heat, rotor bar cracking) |
+| Alarm threshold | ~657 | Health index crosses 0.65 -- bearing BPFO peaks visible |
+| Critical threshold | ~819 | Health index crosses 0.40 -- MCSA broken bar sidebands prominent |
+| **Pump trip** | 900 | Health < 0.30 -- auto-shutdown. Discharge pressure drops to ambient |
+| **Fire pump start** | 920 | Fire pump auto-starts, pressure recovers to ~130 PSI |
+| Post-event | 920-1200 | Stable on fire pump, jockey pump offline |
+
+**Outputs** (in `output/`):
+- `pump_health_results.png` -- 10-panel plot (5x2 grid, see below)
+- `pump_health_state.json` -- event log with health scores, fault diagnoses, and gossip verdicts
+
+**Plot panels (5x2 grid):**
+
+| Panel | Title | Shows |
+|-------|-------|-------|
+| (a) | Vibration Spectrum | BPFO peak growth over time as bearing degrades |
+| (b) | Vibration Health | RMS velocity, ISO 10816-3 thresholds (alarm/trip), bearing SNR |
+| (c) | Temperature Trends | DE/NDE bearing, winding, seal temperatures vs alarm/trip deltas |
+| (d) | Temperature Health | Per-channel and composite temperature health score |
+| (e) | Motor Current Spectrum | 50 Hz fundamental with broken rotor bar sidebands emerging |
+| (f) | MCSA Health | Sideband-to-fundamental ratio, broken bar and eccentricity scores |
+| (g) | Composite Health Index | Weighted fusion of all three modalities with alarm/critical/trip thresholds |
+| (h) | Fault Diagnosis | Active fault flags over time (bearing, imbalance, thermal, broken bar, eccentricity) |
+| (i) | Spatial Pressure | 6-node pressure distribution including pump trip transient |
+| (j) | Gossip + CfC | Gossip verdicts and CfC overrides during pump failure event |
+
 ---
 
 ## Results
@@ -320,13 +420,28 @@ Simulates 6 ARS sensors on a fire ring main (120-220 PSI, seawater):
 
 The CfC judge reduces the false alarm rate by **68%** (44 -> 14 confirmed events) while preserving 100% true positive detection. All overrides are during recovery transitions where the gossip protocol's slow EMA hasn't yet settled.
 
+### Pump Health Performance
+
+| Metric | Value |
+|--------|-------|
+| Initial health (t=0) | 0.85 (healthy) |
+| Alarm threshold crossed | t=657 (health=0.65) |
+| Critical threshold crossed | t=819 (health=0.39) |
+| Pump trip | t=900 (health=0.29) |
+| Fire pump auto-start | t=920 |
+| First fault detected | Bearing defect (BPFO SNR rise) |
+| MCSA broken bar detection | Sideband ratio > -40 dB at ~t=750 |
+| False positives at severity=0 | 0 (noise-floor subtraction eliminates spectral leakage artifacts) |
+
+The degradation arc tracks realistically: vibration (bearing wear) leads, followed by temperature (thermal lag from time constants), then MCSA (broken bar sidebands grow slowly). The critical-override rule ensures that even if two modalities read healthy, a single critically failed channel caps the composite score.
+
 ---
 
 ## File Structure
 
 ```
 sairen-guardian/
-|-- ars_pisnn_prototype.py          # Everything (2,641 lines, single file)
+|-- ars_pisnn_prototype.py          # Everything (~3,800 lines, single file)
 |-- ARS-FIREWATER-CONCEPT.md        # 6-sensor deployment concept note
 |-- SAIREN-firewater-pitch.md       # Business pitch for fire ring main monitoring
 |-- SAIREN-FireMain-Pilot-Spec.md   # Pilot installation specification
@@ -338,6 +453,8 @@ sairen-guardian/
 |   |-- column_weights.json         # Serialised output weights
 |   |-- mesh_results.png            # 5-panel mesh demo plots
 |   |-- mesh_state.json             # Full mesh event log + CfC verdicts
+|   |-- pump_health_results.png     # 10-panel pump health demo plots
+|   |-- pump_health_state.json      # Pump health event log + fault diagnoses
 ```
 
 ### Code Organisation (within `ars_pisnn_prototype.py`)
@@ -345,6 +462,7 @@ sairen-guardian/
 | Section | Lines | Classes / Functions |
 |---------|-------|-------------------|
 | 1. Configuration | ~80 | `Config`, `MeshConfig` |
+| 1b. Pump Health Config | ~80 | `PumpHealthConfig` (mechanical, bearing, MCSA, thermal, fusion params) |
 | 2. Data Simulator | ~100 | `generate_spectrum()`, `generate_dataset()`, physics functions |
 | 3. PI-SNN Model | ~250 | `PISNN` (forward, backward, LIF simulation, physics residual) |
 | 4. Training Loop | ~60 | `train_model()` |
@@ -353,14 +471,16 @@ sairen-guardian/
 | 7. Single-Node Demo | ~220 | `run_demo()` |
 | 8. Gossip Mesh | ~450 | `SensorNode`, `GossipProtocol`, `GossipMessage/Vote/Round` |
 | 8b. CfC Judge | ~400 | `NcpWiringCfC`, `CfcCell`, `CfcJudge`, `CfcForwardCache` |
+| 8c. Pump Health | ~550 | `PumpPhysics`, `PumpSensorSimulator`, `PumpHealthAnalyzer` |
 | 9. Mesh Orchestration | ~200 | `MeshNetwork`, `SpatialPressureSimulator` |
 | 10. Mesh Demo | ~300 | `run_mesh_demo()` |
+| 11. Pump Health Demo | ~250 | `run_pump_health_demo()` |
 
 ---
 
 ## Configuration
 
-All parameters are centralised in two dataclasses. Nothing is hardcoded elsewhere.
+All parameters are centralised in three dataclasses. Nothing is hardcoded elsewhere.
 
 ### `Config` (single-node)
 
@@ -383,6 +503,18 @@ All parameters are centralised in two dataclasses. Nothing is hardcoded elsewher
 | Gossip | `gossip_trigger_threshold`, `gossip_trigger_consecutive`, `gossip_quorum` | 0.5, 3, 0.5 |
 | Spatial | `leak_attenuation_per_m` | 0.05 /m |
 | CfC Judge | `cfc_n_sensory/inter/command/motor`, `cfc_bptt_depth`, `cfc_surprise_*_pct` | 24/12/8/4, depth=4, 25th/90th |
+
+### `PumpHealthConfig` (pump health monitoring)
+
+| Group | Key parameters | Defaults |
+|-------|---------------|----------|
+| Motor | `pump_power_kw`, `pump_rpm`, `motor_poles`, `supply_freq_hz` | 7.5 kW, 2950 RPM, 2-pole, 50 Hz |
+| Bearing (6205) | `bearing_n_balls`, `bearing_ball_dia_mm`, `bearing_pitch_dia_mm`, `bearing_contact_angle` | 9, 7.938 mm, 38.5 mm, 0° |
+| MCSA | `motor_slip`, `mcsa_fft_bins`, `mcsa_max_freq_hz`, `broken_bar_threshold_db` | 0.017, 2048, 200 Hz, -40 dB |
+| Temperature | `temp_nominal_*`, `temp_alarm_delta`, `temp_trip_delta` | DE=45°C, NDE=40°C, winding=65°C, seal=35°C; +15/+25°C |
+| Vibration | `vib_alarm_rms`, `vib_trip_rms` | 4.5 mm/s, 7.1 mm/s (ISO 10816-3) |
+| Fusion | `health_weight_vib/temp/mcsa`, `critical_override_threshold` | 0.4/0.3/0.3, 0.2 |
+| Demo scenario | `pump_degradation_start/end`, `pump_trip_step`, `fire_pump_start_step` | 300/900, 900, 920 |
 
 ---
 
@@ -411,6 +543,18 @@ The CfC learns by predicting the next mesh state from the current one. No labels
 ### Cooldown on original verdict, not CfC override
 
 When the CfC overrides a CONFIRMED to DENIED, the mesh cooldown still activates (based on the original gossip verdict). Without this, overridden rounds don't suppress subsequent gossip, causing a flood of rounds during recovery. The EMA deviation that triggered gossip is real (it just isn't a new event), and the slow EMA needs time to settle regardless of the CfC's assessment.
+
+### Noise-floor subtraction for MCSA
+
+The 50 Hz fundamental's spectral leakage (Gaussian tail with width=0.5 Hz) produces non-zero amplitude at broken bar sideband frequencies (48.3 Hz), which naive peak detection picks up as a fault. The fix measures the median amplitude in a band around each sideband (excluding the peak itself) as the local noise floor, then scores only the excess above noise. This eliminated false positive MCSA detections at zero fault severity.
+
+### Tri-modal fusion with critical override
+
+A weighted average of three health scores (vibration 40%, temperature 30%, MCSA 30%) can mask a critically failed subsystem. If a bearing is disintegrating (vibration health = 0.1) but the motor current and temperature look fine, the weighted average might still read 0.65 (healthy). The critical-override rule caps the composite at 0.3 whenever any single modality drops below 0.2 -- ensuring that catastrophic failure in any channel triggers an alarm regardless of the others.
+
+### Imbalance threshold calibration
+
+A running pump always has some 1x shaft-frequency vibration component (healthy SNR ~5-8). Early iterations flagged imbalance from step 0 because the threshold was too low (`SNR > 3.0`). The corrected threshold (`SNR > 8.0`) only triggers when shaft vibration grows well above the healthy baseline, matching real-world practice where 1x is monitored for trend changes, not absolute presence.
 
 ### Single file by design
 
